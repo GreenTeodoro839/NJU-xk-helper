@@ -4,14 +4,14 @@
 
 ## 效果图
 
-![登录](https://www.zcec.top/usr/uploads/2026/01/2448730740.png)
+![登录](https://www.zcec.top/usr/uploads/2026/02/2537825982.gif)
 
 ![选课](https://www.zcec.top/usr/uploads/2026/01/1251060327.png)
 
 ## 功能特性
 
 - **自动登录**：自动完成统一身份认证登录 + 点选验证码识别
-- **本地验证码识别**：基于 ddddocr 的离线 OCR，无需第三方打码平台，提供 4 档精度可选
+- **本地验证码识别**：针对选课平台验证码训练的轻量ONNX模型，快速识别，准确率高
 - **循环抢课**：自动轮询选课接口，抢到后自动移除并通过 Server 酱推送通知
 - **Session 缓存**：登录态本地缓存复用，减少重复登录
 - **并发模式**：`xk_quick.py` 支持多线程并发提交，适合开放选课瞬间抢课
@@ -21,24 +21,27 @@
 ## 项目结构
 
 ```
-├── xk.conf               # 主配置文件（账号、代理、验证码精度等）
-├── course.conf           # 课程配置（选课批次 + 课程列表）
-├── xk.py                 # 主抢课脚本（循环模式）
-├── xk_quick.py           # 快速抢课脚本（并发模式）
-├── xklogin.py            # 登录流程（验证码获取→识别→提交）
-├── login.py              # Session 管理（缓存/验证/刷新）
-├── captcha.py            # 验证码识别统一入口（从 xk.conf 读取精度级别）
-├── captcha_fast.py       # 验证码识别 - 极速版（~1.0s，28 次 OCR）
-├── captcha_balanced.py   # 验证码识别 - 均衡版（~1.3s，48 次 OCR）
-├── captcha_accurate.py   # 验证码识别 - 精准版（~1.6s，72 次 OCR）
-├── captcha_max.py        # 验证码识别 - 最高精度版（~8s，640 次 OCR + 轮廓匹配）
-├── des_encrypt.py        # DES 密码加密（移植自前端 JS）
-├── serverchan.py         # Server 酱推送通知
+├── xk.py                     # 主抢课脚本（循环模式）
+├── xk_quick.py               # 快速抢课脚本（并发模式）
+├── README.md
+├── config/
+│   ├── xk.conf               # 主配置文件（账号、代理等）
+│   └── course.conf           # 课程配置（选课批次 + 课程列表）
+├── models/
+│   ├── upper_model.onnx      # 验证码识别模型（上方字符）
+│   └── title_model.onnx      # 验证码识别模型（标题字符）
+├── lib/
+│   ├── session_manager.py    # 登录态管理（缓存/验证/刷新）
+│   ├── authenticator.py      # 登录流程执行（验证码获取→识别→提交）
+│   ├── captcha.py            # 验证码识别
+│   ├── des_encrypt.py        # DES 密码加密（移植自前端 JS）
+│   ├── serverchan.py         # Server 酱推送通知
+│   └── common.py             # 共享工具（配置加载、AES加密、请求头等）
 └── tools/
-    ├── get_batch_code.py   # 获取选课批次代码
-    ├── query_course.py     # 课程查询工具（按关键字搜索）
-    ├── input_cookie.py     # 手动导入浏览器 Cookie
-    └── course_decrypt.py   # AES Payload 解密工具
+    ├── get_batch_code.py     # 获取选课批次代码
+    ├── query_course.py       # 课程查询工具（按关键字搜索）
+    ├── input_cookie.py       # 手动导入浏览器 Cookie
+    └── course_decrypt.py     # AES Payload 解密工具
 ```
 
 ## 环境要求
@@ -63,22 +66,15 @@ python -m venv .venv
 source .venv/bin/activate
 
 # 3. 安装依赖
-pip install ddddocr pillow numpy requests pycryptodome serverchan-sdk pysocks
-```
-
-或使用 requirements.txt：
-
-```bash
-pip install -r requirements.txt
+pip install onnxruntime pillow numpy requests serverchan-sdk pysocks
 ```
 
 > **依赖说明**
 > | 包名 | 用途 |
 > |------|------|
-> | `ddddocr` | 本地验证码 OCR 识别 |
+> | `onnxruntime` | 验证码 ONNX 模型推理 |
 > | `pillow` | 图像处理 |
 > | `numpy` | 矩阵计算（匹配算法） |
-> | `opencv-python` | 轮廓匹配（仅 `captcha_max.py` 需要） |
 > | `requests` | HTTP 请求 |
 > | `pycryptodome` | AES/DES 加密 |
 > | `serverchan-sdk` | Server 酱推送（可选，不装不影响运行） |
@@ -86,7 +82,7 @@ pip install -r requirements.txt
 
 ## 配置
 
-### xk.conf
+### config/xk.conf
 
 主配置文件，JSON 格式：
 
@@ -96,7 +92,6 @@ pip install -r requirements.txt
     "PWD": "你的密码",
     "PWD_ENCRYPT": "",
     "MAX_RETRIES": "20",
-    "CAPTCHA_LEVEL": "balanced",
     "SCT_KEY": "你的Server酱SendKey",
     "SCT_OPTIONS": {
         "tags": "选课脚本"
@@ -111,25 +106,15 @@ pip install -r requirements.txt
 | `PWD` | ✅ | 密码明文（脚本自动加密后提交，推荐填这个） |
 | `PWD_ENCRYPT` | ❌ | 密码加密文本（和明文二选一，获取方式见下方） |
 | `MAX_RETRIES` | ❌ | 登录最大重试次数，默认 `3` |
-| `CAPTCHA_LEVEL` | ❌ | 验证码识别精度，默认 `balanced`（见下方说明） |
-| `SCT_KEY` | ❌ | Server 酱 SendKey，不填则不推送 |
-| `SCT_OPTIONS` | ❌ | Server 酱附加选项 |
-| `PROXY` | ❌ | 代理地址，支持 `socks5://` 和 `http://` |
+| `SCT_KEY`     | ❌    | Server 酱 SendKey，不填则不推送              |
+| `SCT_OPTIONS` | ❌    | Server 酱附加选项                            |
+| `PROXY`       | ❌    | 代理地址，支持 `socks5://` 和 `http://`      |
 
 > **获取加密密码**（如果不想填明文）：在选课平台按 F12 打开开发者工具，选 Network，登录后找到登录请求，复制 `loginPwd` 字段的值填入 `PWD_ENCRYPT`。
 >
 > ![获取密码](https://www.zcec.top/usr/uploads/2026/01/3740882447.png)
 
-#### 验证码精度级别（CAPTCHA_LEVEL）
-
-| 级别 | OCR 次数/张 | 速度 | 说明 |
-|------|-------------|------|------|
-| `fast` | 28 | ~1.0s | 极速，适合超时严格的场景 |
-| `balanced` | 48 | ~1.3s | **推荐**，速度与准确率兼顾 |
-| `accurate` | 72 | ~1.6s | 精准，牺牲一点速度换更高准确率 |
-| `max` | 640 | ~8.0s | 最高精度，离线批量处理用 |
-
-### course.conf
+### config/course.conf
 
 课程配置文件，JSON 格式：
 
@@ -194,7 +179,7 @@ pip install -r requirements.txt
 python tools/get_batch_code.py
 ```
 
-运行后自动将 `electiveBatchCode` 写入 `course.conf`。
+运行后自动将 `electiveBatchCode` 写入 `config/course.conf`。
 
 ### 2. 查询课程 ID
 
@@ -202,7 +187,7 @@ python tools/get_batch_code.py
 python tools/query_course.py
 ```
 
-输入课程名或教师名搜索，支持翻页（`u`/`d`），输入编号查看课程 ID，然后按提示直接写入或手动填写 `course.conf`。
+输入课程名或教师名搜索，支持翻页（`u`/`d`），输入编号查看课程 ID，然后按提示直接写入或手动填写 `config/course.conf`。
 
 ### 3. 运行抢课（循环模式，捡漏专用）
 
@@ -242,7 +227,7 @@ python tools/input_cookie.py
 |------|------|
 | `tools/get_batch_code.py` | 连接选课系统获取当前可用的选课批次代码 |
 | `tools/query_course.py` | 按关键字搜索课程，查看课程 ID 等信息 |
-| `tools/input_cookie.py` | 从浏览器手动复制 Cookie/Token 写入 `session_cache.json` |
+| `tools/input_cookie.py` | 从浏览器手动复制 Cookie/Token 写入缓存 |
 | `tools/course_decrypt.py` | 解密选课请求的 AES 加密 Payload，用于调试 |
 
 ## 免责声明

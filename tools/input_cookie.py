@@ -1,8 +1,15 @@
+"""手动导入浏览器 Cookie/Token 到 session_cache.json。"""
+
 import json
 import os
+import sys
 import time
 
-# 只保留这几个对选课系统有用的 cookie key
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+
+from lib.common import SESSION_CACHE_FILE
+
 USEFUL_KEYS = {"_WEU", "JSESSIONID", "route"}
 
 
@@ -13,7 +20,6 @@ def get_input():
 
 
 def parse_cookie(cookie_str):
-    """解析 cookie 字符串，只保留有用的字段"""
     cookie_dict = {}
     for item in cookie_str.split(';'):
         item = item.strip()
@@ -26,16 +32,14 @@ def parse_cookie(cookie_str):
 
 
 def write_session_cache(cookies, token):
-    """按 login.py 的格式写入 session_cache.json"""
     session = {
         "cookies": cookies,
         "token": token,
-        "timestamp": time.time()
+        "timestamp": time.time(),
     }
-    cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'session_cache.json')
-    with open(cache_path, 'w', encoding='utf-8') as f:
+    with open(SESSION_CACHE_FILE, 'w', encoding='utf-8') as f:
         json.dump(session, f, ensure_ascii=False)
-    return cache_path
+    return SESSION_CACHE_FILE
 
 
 if __name__ == "__main__":
@@ -46,5 +50,5 @@ if __name__ == "__main__":
     if missing:
         print(f"⚠️ cookie 中缺少以下字段: {', '.join(missing)}")
 
-    write_session_cache(cookies, token)
-    print(f"✅ session_cache.json 已更新，包含 cookie: {list(cookies.keys())}")
+    path = write_session_cache(cookies, token)
+    print(f"✅ {path} 已更新，包含 cookie: {list(cookies.keys())}")

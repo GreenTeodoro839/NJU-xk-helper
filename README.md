@@ -66,7 +66,7 @@ python -m venv .venv
 source .venv/bin/activate
 
 # 3. 安装依赖
-pip install onnxruntime pillow numpy requests serverchan-sdk pysocks
+pip install onnxruntime pillow numpy requests pycryptodome serverchan-sdk pysocks
 ```
 
 > **依赖说明**

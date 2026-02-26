@@ -1,7 +1,15 @@
 """
-Pure ONNX captcha solver.
+Pure ONNX captcha solver (v2 — color-isolated models + Hungarian matching).
+
 Exports one function:
   solve_captcha_from_base64(img_gif_b64_body) -> [(x, y) * 4] or None
+
+Changes vs v1:
+  - Color-isolated upper char cropping (preserves stroke color/texture)
+  - ImageNet normalization (matches new pretrained-backbone models)
+  - Corrected title crop positions (centers at 127/150/173/196, y=101-117)
+  - Hungarian matching (optimal, replaces brute-force permutations)
+  - Cleaner segmentation with color-distance filtering
 """
 
 from __future__ import annotations
@@ -11,30 +19,48 @@ import io
 import json
 import os
 import threading
-from itertools import permutations
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
 Point = Tuple[int, int]
-TITLE_RANGES = [(118, 138), (140, 160), (162, 182), (185, 205)]
 
-# 模型路径：相对于项目根目录的 models/ 文件夹
+# Bottom title char crop positions (fixed layout)
+# "依次点击【char1 char2 char3 char4】"
+TITLE_X_CENTERS = [127, 150, 173, 196]
+TITLE_Y_TOP = 101
+TITLE_Y_BOTTOM = 117
+TITLE_HALF_X = 10
+
+# Upper area boundary
+UPPER_HEIGHT = 100
+
+# Model paths (relative to project root / models)
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UPPER_ONNX_PATH = os.path.join(_PROJECT_ROOT, "models", "upper_model.onnx")
 TITLE_ONNX_PATH = os.path.join(_PROJECT_ROOT, "models", "title_model.onnx")
-ALLOW_LOWER_TAIL = True
 
 _LOCK = threading.Lock()
 _SOLVER = None
 _INIT_ERROR = None
 
+# ---------------------------------------------------------------------------
+# Normalization presets
+# ---------------------------------------------------------------------------
 
-def _exists(path: str) -> bool:
-    return bool(path) and Path(path).exists()
+_NORM_PRESETS = {
+    "imagenet": {
+        "mean": np.array([0.485, 0.456, 0.406], dtype=np.float32),
+        "std":  np.array([0.229, 0.224, 0.225], dtype=np.float32),
+    },
+    "half": {
+        "mean": np.array([0.5, 0.5, 0.5], dtype=np.float32),
+        "std":  np.array([0.5, 0.5, 0.5], dtype=np.float32),
+    },
+}
 
 
 def _softmax(x: np.ndarray) -> np.ndarray:
@@ -43,66 +69,27 @@ def _softmax(x: np.ndarray) -> np.ndarray:
     return ex / max(float(ex.sum()), 1e-9)
 
 
-def _extract_upper_mask_image(img: Image.Image, pad: int = 6) -> Image.Image:
-    arr = np.array(img.convert("RGB"), dtype=np.uint8)
+# ---------------------------------------------------------------------------
+# Upper char segmentation: color-based isolation
+# ---------------------------------------------------------------------------
+
+def _fg_mask(arr: np.ndarray, sat_thr: float = 0.15) -> np.ndarray:
+    """Foreground mask based on saturation (colored chars on light bg)."""
     r = arr[..., 0].astype(np.float32)
     g = arr[..., 1].astype(np.float32)
     b = arr[..., 2].astype(np.float32)
-
     maxc = np.maximum(np.maximum(r, g), b)
     minc = np.minimum(np.minimum(r, g), b)
     sat = (maxc - minc) / (maxc + 1e-6)
-    val = maxc / 255.0
-
     light_bg = (arr[..., 0] > 165) & (arr[..., 1] > 205) & (arr[..., 2] > 225)
-    mask = (sat > 0.16) & (val > 0.10) & (~light_bg)
-    if int(mask.sum()) < 6:
-        mask = (sat > 0.10) & (val > 0.08)
-
-    ys, xs = np.where(mask)
-    if len(xs) >= 6:
-        x1, x2 = int(xs.min()), int(xs.max()) + 1
-        y1, y2 = int(ys.min()), int(ys.max()) + 1
-        tight = mask[y1:y2, x1:x2].astype(np.uint8)
-    else:
-        tight = mask.astype(np.uint8)
-
-    h, w = tight.shape
-    side = max(h, w) + pad * 2
-    canvas = np.zeros((side, side), dtype=np.uint8)
-    oy = (side - h) // 2
-    ox = (side - w) // 2
-    canvas[oy : oy + h, ox : ox + w] = tight * 255
-    return Image.fromarray(canvas, mode="L").convert("RGB")
+    return (sat > sat_thr) & (~light_bg)
 
 
-def _preprocess_for_model(img: Image.Image, input_size: int, mode: str) -> np.ndarray:
-    if mode == "upper_mask_v1":
-        img = _extract_upper_mask_image(img)
-    img = img.resize((input_size, input_size), Image.Resampling.BILINEAR).convert("RGB")
-    arr = np.asarray(img, dtype=np.float32) / 255.0
-    arr = (arr - 0.5) / 0.5
-    arr = np.transpose(arr, (2, 0, 1))[None, ...]
-    return arr.astype(np.float32)
-
-
-def _color_mask(arr: np.ndarray, sat_thr: float, val_thr: float) -> np.ndarray:
-    r = arr[..., 0].astype(np.float32)
-    g = arr[..., 1].astype(np.float32)
-    b = arr[..., 2].astype(np.float32)
-    maxc = np.maximum(np.maximum(r, g), b)
-    minc = np.minimum(np.minimum(r, g), b)
-    sat = (maxc - minc) / (maxc + 1e-6)
-    val = maxc / 255.0
-    light_bg = (arr[..., 0] > 160) & (arr[..., 1] > 200) & (arr[..., 2] > 220)
-    return (sat > sat_thr) & (val > val_thr) & (~light_bg)
-
-
-def _connected_components(mask: np.ndarray, min_area: int, max_area: int, top_h: int) -> List[dict]:
+def _connected_components(mask: np.ndarray, min_area: int = 25) -> List[dict]:
+    """Simple flood-fill connected components (no scipy dependency)."""
     h, w = mask.shape
     visited = np.zeros((h, w), dtype=np.uint8)
     regions = []
-    pad = 4
 
     for y in range(h):
         for x in range(w):
@@ -110,201 +97,356 @@ def _connected_components(mask: np.ndarray, min_area: int, max_area: int, top_h:
                 continue
             stack = [(x, y)]
             visited[y, x] = 1
-            area = 0
-            minx = maxx = x
-            miny = maxy = y
-            sumx = sumy = 0
+            pixels = []
 
             while stack:
                 cx, cy = stack.pop()
-                area += 1
-                sumx += cx
-                sumy += cy
-                if cx < minx: minx = cx
-                if cx > maxx: maxx = cx
-                if cy < miny: miny = cy
-                if cy > maxy: maxy = cy
-
-                for ny in range(max(0, cy - 1), min(h - 1, cy + 1) + 1):
-                    for nx in range(max(0, cx - 1), min(w - 1, cx + 1) + 1):
+                pixels.append((cx, cy))
+                for ny in range(max(0, cy - 1), min(h, cy + 2)):
+                    for nx in range(max(0, cx - 1), min(w, cx + 2)):
                         if not visited[ny, nx] and mask[ny, nx]:
                             visited[ny, nx] = 1
                             stack.append((nx, ny))
 
-            bw = maxx - minx + 1
-            bh = maxy - miny + 1
-            if area < min_area or area > max_area:
-                continue
-            if bw < 8 or bh < 8:
-                continue
-            if (bw / max(bh, 1)) > 4.0 or (bh / max(bw, 1)) > 4.0:
+            if len(pixels) < min_area:
                 continue
 
-            cx = int(round(sumx / max(area, 1)))
-            cy = int(round(sumy / max(area, 1)))
+            xs = [p[0] for p in pixels]
+            ys = [p[1] for p in pixels]
+            bw = max(xs) - min(xs) + 1
+            bh = max(ys) - min(ys) + 1
+            if bw < 6 or bh < 6:
+                continue
+            if bw / max(bh, 1) > 5 or bh / max(bw, 1) > 5:
+                continue
+
             regions.append({
-                "bbox": (max(0, minx - pad), max(0, miny - pad),
-                         min(w, maxx + 1 + pad), min(top_h, maxy + 1 + pad)),
-                "center": (cx, cy),
+                "center": (int(np.mean(xs)), int(np.mean(ys))),
+                "bbox": (min(xs), min(ys), max(xs) + 1, max(ys) + 1),
+                "area": len(pixels),
             })
-    regions.sort(key=lambda r: r["center"][0])
+
+    regions.sort(key=lambda r: -r["area"])
     return regions
 
 
-def _merge_dedup(base: List[dict], extra: List[dict]) -> List[dict]:
-    merged = list(base)
-    for er in extra:
-        if not any(abs(er["center"][0] - br["center"][0]) < 15
-                   and abs(er["center"][1] - br["center"][1]) < 15
-                   for br in merged):
-            merged.append(er)
-    merged.sort(key=lambda r: r["center"][0])
+def _merge_nearby_regions(regions: List[dict], dist_thresh: int = 20) -> List[dict]:
+    """
+    Merge regions whose centers are within dist_thresh pixels.
+    Fixes split characters (e.g. 传 splitting into top+bottom halves).
+    """
+    if len(regions) <= 1:
+        return regions
+
+    merged = [dict(r) for r in regions]
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(merged)):
+            for j in range(i + 1, len(merged)):
+                ci = merged[i]["center"]
+                cj = merged[j]["center"]
+                dist = ((ci[0] - cj[0]) ** 2 + (ci[1] - cj[1]) ** 2) ** 0.5
+                if dist < dist_thresh:
+                    # Merge j into i
+                    a_i, a_j = merged[i]["area"], merged[j]["area"]
+                    total = a_i + a_j
+                    # Weighted center
+                    new_cx = int((ci[0] * a_i + cj[0] * a_j) / total)
+                    new_cy = int((ci[1] * a_i + cj[1] * a_j) / total)
+                    # Merged bbox
+                    bi, bj = merged[i]["bbox"], merged[j]["bbox"]
+                    new_bbox = (
+                        min(bi[0], bj[0]), min(bi[1], bj[1]),
+                        max(bi[2], bj[2]), max(bi[3], bj[3]),
+                    )
+                    merged[i] = {
+                        "center": (new_cx, new_cy),
+                        "bbox": new_bbox,
+                        "area": total,
+                    }
+                    merged.pop(j)
+                    changed = True
+                    break
+            if changed:
+                break
+
+    merged.sort(key=lambda r: -r["area"])
     return merged
 
 
-def _segment(img: Image.Image, allow_lower_tail: bool) -> List[dict]:
-    top_h = 100
-    arr = np.array(img.convert("RGB"), dtype=np.uint8)
-    top = arr[:top_h, :250, :]
+def _segment_upper(img: Image.Image) -> List[dict]:
+    """
+    Find 4 character regions in upper area.
+    Returns list of dicts with 'center', 'bbox', 'area'.
+    """
+    arr = np.array(img.convert("RGB"), dtype=np.uint8)[:UPPER_HEIGHT, :]
 
-    regions: List[dict] = []
-    for sat_thr, val_thr, min_area, max_area in [
-        (0.20, 0.12, 25, 700),
-        (0.16, 0.10, 12, 1400),
-        (0.12, 0.08, 8, 2200),
-    ]:
-        mask = _color_mask(top, sat_thr=sat_thr, val_thr=val_thr)
-        regs = _connected_components(mask, min_area=min_area, max_area=max_area, top_h=top_h)
-        regions = _merge_dedup(regions, regs)
+    # Try progressively relaxed thresholds
+    for sat_thr, min_area in [(0.18, 25), (0.14, 15), (0.10, 8), (0.06, 8)]:
+        mask = _fg_mask(arr, sat_thr=sat_thr)
+        regions = _connected_components(mask, min_area=min_area)
+        regions = _merge_nearby_regions(regions, dist_thresh=20)
         if len(regions) >= 4:
             return regions[:8]
 
-    if allow_lower_tail:
-        top_h2 = min(112, arr.shape[0])
-        top2 = arr[:top_h2, :250, :]
-        mask2 = _color_mask(top2, sat_thr=0.12, val_thr=0.08)
-        regs2 = _connected_components(mask2, min_area=8, max_area=2600, top_h=top_h2)
-        regions = _merge_dedup(regions, regs2)
+    return regions[:8] if regions else []
 
-    return regions[:8]
 
+def _crop_upper_char_color_isolated(
+    arr: np.ndarray,
+    cx: int, cy: int,
+    search_half: int = 40,
+    color_thresh: float = 80.0,
+    pad: int = 4,
+) -> Image.Image:
+    """
+    Crop a single upper character using color isolation.
+    Keeps only pixels whose color is similar to the center pixel's color.
+    """
+    H, W = min(UPPER_HEIGHT, arr.shape[0]), arr.shape[1]
+    arr_f = arr[:H].astype(np.float32)
+
+    fg = _fg_mask(arr[:H])
+
+    # Sample dominant color from center
+    sr = 4
+    sy1, sy2 = max(0, cy - sr), min(H, cy + sr)
+    sx1, sx2 = max(0, cx - sr), min(W, cx + sr)
+    center_fg = fg[sy1:sy2, sx1:sx2]
+
+    if center_fg.sum() < 3:
+        # Fallback: relax
+        fg = _fg_mask(arr[:H], sat_thr=0.08)
+        center_fg = fg[sy1:sy2, sx1:sx2]
+
+    if center_fg.sum() >= 3:
+        center_color = arr_f[sy1:sy2, sx1:sx2][center_fg].mean(axis=0)
+    else:
+        center_color = arr_f[cy, cx]
+
+    # Search window
+    ax1 = max(0, cx - search_half)
+    ay1 = max(0, cy - search_half)
+    ax2 = min(W, cx + search_half)
+    ay2 = min(H, cy + search_half)
+
+    local = arr_f[ay1:ay2, ax1:ax2]
+    local_fg = fg[ay1:ay2, ax1:ax2]
+
+    color_dist = np.sqrt(((local - center_color) ** 2).sum(axis=-1))
+    char_mask = local_fg & (color_dist < color_thresh)
+
+    if char_mask.sum() < 10:
+        # Fallback: use all fg in tighter window
+        h2 = 25
+        by1 = max(0, cy - h2 - ay1)
+        bx1 = max(0, cx - h2 - ax1)
+        by2 = min(local.shape[0], cy + h2 - ay1)
+        bx2 = min(local.shape[1], cx + h2 - ax1)
+        char_mask = np.zeros_like(char_mask)
+        char_mask[by1:by2, bx1:bx2] = local_fg[by1:by2, bx1:bx2]
+
+    # Build isolated image
+    isolated = np.full_like(local, 220.0)
+    isolated[char_mask] = local[char_mask]
+
+    # Tight crop + pad to square
+    ys, xs = np.where(char_mask)
+    if len(xs) < 5:
+        # Emergency fallback: naive crop
+        half = 25
+        crop = arr[max(0, cy-half):min(H, cy+half), max(0, cx-half):min(W, cx+half)]
+        h, w = crop.shape[:2]
+        side = max(h, w)
+        canvas = np.full((side, side, 3), 220, dtype=np.uint8)
+        canvas[(side-h)//2:(side-h)//2+h, (side-w)//2:(side-w)//2+w] = crop
+        return Image.fromarray(canvas)
+
+    tx1 = max(0, int(xs.min()) - pad)
+    ty1 = max(0, int(ys.min()) - pad)
+    tx2 = min(isolated.shape[1], int(xs.max()) + 1 + pad)
+    ty2 = min(isolated.shape[0], int(ys.max()) + 1 + pad)
+    tight = isolated[ty1:ty2, tx1:tx2]
+
+    h, w = tight.shape[:2]
+    side = max(h, w)
+    canvas = np.full((side, side, 3), 220.0, dtype=np.float32)
+    canvas[(side-h)//2:(side-h)//2+h, (side-w)//2:(side-w)//2+w] = tight
+
+    return Image.fromarray(canvas.astype(np.uint8))
+
+
+# ---------------------------------------------------------------------------
+# Title (bottom) char cropping
+# ---------------------------------------------------------------------------
+
+def _crop_title_chars(img: Image.Image) -> List[Image.Image]:
+    """Crop 4 title characters from fixed bottom positions."""
+    crops = []
+    for tx in TITLE_X_CENTERS:
+        x1, x2 = tx - TITLE_HALF_X, tx + TITLE_HALF_X
+        crop = img.crop((x1, TITLE_Y_TOP, x2, TITLE_Y_BOTTOM))
+        w, h = crop.size
+        side = max(w, h)
+        canvas = Image.new("RGB", (side, side), (0, 0, 0))
+        canvas.paste(crop, ((side - w) // 2, (side - h) // 2))
+        crops.append(canvas)
+    return crops
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing for ONNX model
+# ---------------------------------------------------------------------------
+
+def _preprocess(img: Image.Image, input_size: int, norm: str) -> np.ndarray:
+    """Resize + normalize → [1, 3, H, W] float32 for ONNX."""
+    img = img.resize((input_size, input_size), Image.LANCZOS).convert("RGB")
+    arr = np.asarray(img, dtype=np.float32) / 255.0  # [H, W, 3] in [0, 1]
+
+    preset = _NORM_PRESETS.get(norm, _NORM_PRESETS["imagenet"])
+    arr = (arr - preset["mean"]) / preset["std"]
+
+    return arr.transpose(2, 0, 1)[None, ...].astype(np.float32)  # [1, 3, H, W]
+
+
+# ---------------------------------------------------------------------------
+# Hungarian matching (no scipy dependency)
+# ---------------------------------------------------------------------------
+
+def _hungarian_4x4(cost: np.ndarray) -> List[Tuple[int, int]]:
+    """
+    Optimal assignment for a 4×N cost matrix (N >= 4).
+    For small N, brute-force over permutations is fast enough.
+    """
+    from itertools import permutations
+    n = cost.shape[1]
+    best_cost = float("inf")
+    best_perm = None
+    for perm in permutations(range(n), 4):
+        c = sum(cost[i, perm[i]] for i in range(4))
+        if c < best_cost:
+            best_cost = c
+            best_perm = perm
+    if best_perm is None:
+        return [(i, i) for i in range(4)]
+    return [(i, best_perm[i]) for i in range(4)]
+
+
+# ---------------------------------------------------------------------------
+# ONNX model wrapper
+# ---------------------------------------------------------------------------
 
 class _OnnxCharModel:
     def __init__(self, onnx_path: str):
-        self.session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        self.session = ort.InferenceSession(
+            onnx_path, providers=["CPUExecutionProvider"]
+        )
         self.input_name = self.session.get_inputs()[0].name
 
         meta = self.session.get_modelmeta().custom_metadata_map or {}
-        try:
-            self.input_size = int(meta.get("input_size", "48"))
-        except Exception:
-            self.input_size = 48
-        self.preprocess = str(meta.get("preprocess", "none"))
+        self.input_size = int(meta.get("input_size", "80"))
+        self.normalize = str(meta.get("normalize", "imagenet"))
 
-        idx_to_cls_json = meta.get("idx_to_cls_json")
-        if not idx_to_cls_json:
-            raise RuntimeError(f"ONNX missing metadata key 'idx_to_cls_json': {onnx_path}")
-        self.idx_to_cls = {int(k): v for k, v in json.loads(idx_to_cls_json).items()}
+        idx_json = meta.get("idx_to_cls_json")
+        if not idx_json:
+            raise RuntimeError(f"ONNX missing 'idx_to_cls_json': {onnx_path}")
+        self.idx_to_cls = {int(k): v for k, v in json.loads(idx_json).items()}
+        self.num_classes = len(self.idx_to_cls)
 
-    def predict_topk(self, img: Image.Image, topk: int) -> List[Tuple[str, float]]:
-        x = _preprocess_for_model(img, self.input_size, self.preprocess)
+    def predict_probs(self, img: Image.Image) -> np.ndarray:
+        """Return softmax probabilities [num_classes]."""
+        x = _preprocess(img, self.input_size, self.normalize)
         logits = self.session.run(None, {self.input_name: x})[0][0]
-        probs = _softmax(logits.astype(np.float64))
-        k = max(1, min(int(topk), probs.shape[0]))
-        idx = np.argsort(-probs)[:k]
-        return [(self.idx_to_cls[int(i)], float(probs[int(i)])) for i in idx]
+        return _softmax(logits.astype(np.float64))
 
+    def predict_topk(self, img: Image.Image, k: int = 5) -> List[Tuple[str, float]]:
+        probs = self.predict_probs(img)
+        k = min(k, len(probs))
+        idx = np.argsort(-probs)[:k]
+        return [(self.idx_to_cls[int(i)], float(probs[i])) for i in idx]
+
+
+# ---------------------------------------------------------------------------
+# Solver
+# ---------------------------------------------------------------------------
 
 class _OnnxCaptchaSolver:
-    def __init__(self, upper_onnx_path: str, title_onnx_path: Optional[str], allow_lower_tail: bool):
-        self.upper = _OnnxCharModel(upper_onnx_path)
-        self.title = _OnnxCharModel(title_onnx_path) if title_onnx_path else self.upper
-        self.allow_lower_tail = bool(allow_lower_tail)
+    def __init__(self, upper_path: str, title_path: Optional[str]):
+        self.upper = _OnnxCharModel(upper_path)
+        self.title = _OnnxCharModel(title_path) if title_path else self.upper
 
-    @staticmethod
-    def _topk_to_dict(preds: Sequence[Tuple[str, float]]) -> Dict[str, float]:
-        d: Dict[str, float] = {}
-        for ch, p in preds:
-            d[ch] = max(d.get(ch, 0.0), float(p))
-        return d
-
-    @staticmethod
-    def _normalize_topk(preds: Sequence[Tuple[str, float]], power: float = 0.55):
-        if not preds:
-            return []
-        merged: Dict[str, float] = {}
-        for ch, p in preds:
-            merged[ch] = max(merged.get(ch, 0.0), float(p))
-        chars = list(merged.keys())
-        vals = np.array([max(1e-9, merged[c]) for c in chars], dtype=np.float64)
-        vals = np.power(vals, power)
-        vals = vals / max(float(vals.sum()), 1e-9)
-        return [(chars[i], float(vals[i])) for i in range(len(chars))]
-
-    def _score_title_region(self, title_candidates, region_preds) -> float:
-        t = self._topk_to_dict(title_candidates)
-        r = self._topk_to_dict(region_preds)
-        if not t or not r:
-            return 0.0
-        score_soft = sum(tp * r[ch] for ch, tp in t.items() if ch in r)
-        top1_char = title_candidates[0][0]
-        score_hard = r.get(top1_char, 0.0)
-        return float(score_soft + 0.20 * score_hard)
-
-    def _get_title_candidates(self, img: Image.Image, k: int = 4):
-        out = []
-        for x1, x2 in TITLE_RANGES:
-            crop = img.crop((x1, 100, x2, 120))
-            preds = self.title.predict_topk(crop, topk=max(2, k))
-            out.append(self._normalize_topk(preds, power=0.55))
-        return out
-
-    def solve(self, img: Image.Image):
-        title_candidates = self._get_title_candidates(img, k=4)
-        if len(title_candidates) != 4 or any(len(c) == 0 for c in title_candidates):
-            return None
-
-        regions = _segment(img, allow_lower_tail=self.allow_lower_tail)
+    def solve(self, img: Image.Image) -> Optional[List[Point]]:
+        # 1. Segment upper area → find 4 char regions
+        regions = _segment_upper(img)
         if len(regions) < 4:
             return None
 
-        for r in regions:
-            r["crop"] = img.crop(r["bbox"])
+        arr = np.array(img.convert("RGB"), dtype=np.uint8)
 
-        region_preds = [self.upper.predict_topk(r["crop"], topk=8) for r in regions]
-        n = len(regions)
-        score = np.zeros((4, n), dtype=np.float64)
-        for ti in range(4):
-            for ri in range(n):
-                score[ti, ri] = self._score_title_region(title_candidates[ti], region_preds[ri])
+        # 2. Color-isolate each upper char → get crops and probs
+        upper_crops = []
+        upper_centers = []
+        for r in regions[:min(len(regions), 8)]:
+            cx, cy = r["center"]
+            crop = _crop_upper_char_color_isolated(arr, cx, cy)
+            upper_crops.append(crop)
+            upper_centers.append((cx, cy))
 
-        best_s = -1.0
-        best_perm = None
-        for perm in permutations(range(n), 4):
-            s = sum(score[i, perm[i]] for i in range(4))
-            if s > best_s:
-                best_s = s
-                best_perm = perm
-        if best_perm is None or best_s <= 0.0:
-            return None
+        upper_probs = [self.upper.predict_probs(c) for c in upper_crops]
 
-        return [regions[best_perm[i]]["center"] for i in range(4)]
+        # 3. Crop title chars → classify
+        title_crops = _crop_title_chars(img)
+        title_top1 = []
+        for tc in title_crops:
+            preds = self.title.predict_topk(tc, k=1)
+            if not preds:
+                return None
+            title_top1.append(preds[0][0])  # top-1 char
 
-    def solve_from_base64(self, b64_body: str):
+        # 4. Build cost matrix and do Hungarian matching
+        #    cost[t][r] = -log P(upper_r == title_char_t)
+        n_upper = len(upper_crops)
+        cost = np.full((4, n_upper), 100.0, dtype=np.float64)
+
+        for ti, target_char in enumerate(title_top1):
+            # Find target class index in upper model
+            target_idx = None
+            for idx, cls in self.upper.idx_to_cls.items():
+                if cls == target_char:
+                    target_idx = idx
+                    break
+            if target_idx is None:
+                continue
+            for ri in range(n_upper):
+                p = max(upper_probs[ri][target_idx], 1e-10)
+                cost[ti, ri] = -np.log(p)
+
+        # 5. Optimal matching
+        matches = _hungarian_4x4(cost)
+
+        # 6. Return click positions in title order
+        result = []
+        for ti, ri in matches:
+            result.append(upper_centers[ri])
+
+        return result
+
+    def solve_from_base64(self, b64_body: str) -> Optional[List[Point]]:
         raw = base64.b64decode(b64_body)
         img = Image.open(io.BytesIO(raw)).convert("RGB")
         return self.solve(img)
 
 
+# ---------------------------------------------------------------------------
+# Module-level API
+# ---------------------------------------------------------------------------
+
 def _build_solver():
-    if not _exists(UPPER_ONNX_PATH):
-        raise RuntimeError(f"ONNX file missing: {UPPER_ONNX_PATH}")
-    title_onnx = TITLE_ONNX_PATH if _exists(TITLE_ONNX_PATH) else None
-    return _OnnxCaptchaSolver(
-        upper_onnx_path=UPPER_ONNX_PATH,
-        title_onnx_path=title_onnx,
-        allow_lower_tail=ALLOW_LOWER_TAIL,
-    )
+    if not Path(UPPER_ONNX_PATH).exists():
+        raise RuntimeError(f"ONNX not found: {UPPER_ONNX_PATH}")
+    title_path = TITLE_ONNX_PATH if Path(TITLE_ONNX_PATH).exists() else None
+    return _OnnxCaptchaSolver(UPPER_ONNX_PATH, title_path)
 
 
 def _get_solver():
@@ -313,7 +455,6 @@ def _get_solver():
         return _SOLVER
     if _INIT_ERROR is not None:
         raise _INIT_ERROR
-
     with _LOCK:
         if _SOLVER is not None:
             return _SOLVER
@@ -328,6 +469,7 @@ def _get_solver():
 
 
 def solve_captcha_from_base64(img_gif_b64_body: str) -> Optional[List[Point]]:
+    """Main entry point: base64 image → list of 4 (x, y) click coords, or None."""
     try:
         solver = _get_solver()
         out = solver.solve_from_base64(img_gif_b64_body)

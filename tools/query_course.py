@@ -146,23 +146,23 @@ def display_page(courses, page_number, is_last, keyword):
 
     if not courses:
         print("  （无结果）")
-        return
+    else:
+        for i, c in enumerate(courses, 1):
+            name = c.get("courseName", "?")
+            teacher = c.get("teacherName", "?")
+            time_str = _format_time(c)
+            campus = c.get("campusName", "?")
+            credit = c.get("credit", "?")
+            _, _, ctype_name = _lookup_kind_type(c.get("jxblx", "?"))
 
-    for i, c in enumerate(courses, 1):
-        name = c.get("courseName", "?")
-        teacher = c.get("teacherName", "?")
-        time_str = _format_time(c)
-        campus = c.get("campusName", "?")
-        credit = c.get("credit", "?")
-        _, _, ctype_name = _lookup_kind_type(c.get("jxblx", "?"))
-
-        print(f"\n  [{i:>2}] {name}  ({credit}学分, {ctype_name})")
-        print(f"       课程号: {c.get('courseNumber', '?')}  |  教师: {teacher}")
-        print(f"       时间: {time_str}")
-        print(f"       校区: {campus}  |  学院: {c.get('departmentName', '?')}")
+            print(f"\n  [{i:>2}] {name}  ({credit}学分, {ctype_name})")
+            print(f"       课程号: {c.get('courseNumber', '?')}  |  教师: {teacher}")
+            print(f"       时间: {time_str}")
+            print(f"       校区: {campus}  |  学院: {c.get('departmentName', '?')}")
 
     print(f"\n{'─'*70}")
     cmds = []
+    # noinspection: cmds 构建区
     if courses: cmds.append("编号=选课")
     if page_number > 0: cmds.append("u=上一页")
     if not is_last: cmds.append("d=下一页")
@@ -309,12 +309,16 @@ def main():
                 print("已经是最后一页了")
                 input("按回车继续...")
         elif cmd.isdigit():
-            idx = int(cmd)
-            if 1 <= idx <= len(courses):
-                _show_course_detail(courses[idx - 1])
-            else:
-                print(f"无效编号，请输入 1~{len(courses)}")
+            if not courses:
+                print("当前无搜索结果，无法选课")
                 input("按回车继续...")
+            else:
+                idx = int(cmd)
+                if 1 <= idx <= len(courses):
+                    _show_course_detail(courses[idx - 1])
+                else:
+                    print(f"无效编号，请输入 1~{len(courses)}")
+                    input("按回车继续...")
         else:
             print("无效输入")
             input("按回车继续...")

@@ -40,6 +40,7 @@
 └── tools/
     ├── get_batch_code.py     # 获取选课批次代码
     ├── query_course.py       # 课程查询工具（按关键字搜索）
+    ├── query_course_v2.py    # 课程查询工具 v2（动态获取参数，推荐）
     ├── input_cookie.py       # 手动导入浏览器 Cookie
     └── course_decrypt.py     # AES Payload 解密工具
 ```
@@ -135,7 +136,13 @@ pip install onnxruntime pillow numpy requests pycryptodome serverchan-sdk pysock
 
 > **如何获取课程参数？**
 >
-> **方法一**：使用课程查询工具搜索课程名，直接获取并添加课程：
+> **方法一（推荐）**：使用课程查询工具 v2，课程参数从平台动态获取，无需依赖硬编码对照表：
+>
+> ```bash
+> python tools/query_course_v2.py
+> ```
+>
+> **方法一（旧版）**：使用课程查询工具搜索课程名（依赖硬编码对照表）：
 >
 > ```bash
 > python tools/query_course.py
@@ -181,13 +188,15 @@ python tools/get_batch_code.py
 
 运行后自动将 `electiveBatchCode` 写入 `config/course.conf`。
 
-### 2. 查询课程 ID
+### 2. 查询课程 ID（推荐 v2）
 
 ```bash
-python tools/query_course.py
+python tools/query_course_v2.py
 ```
 
-输入课程名或教师名搜索，支持翻页（`u`/`d`），输入编号查看课程 ID，然后按提示直接写入或手动填写 `config/course.conf`。
+v2 版本会自动从选课平台获取 courseKind / teachingClassType 映射，不依赖硬编码对照表。输入课程名或教师名搜索，支持翻页（`u`/`d`），输入编号查看课程 ID，然后按提示直接写入或手动填写 `config/course.conf`。
+
+> 旧版 `python tools/query_course.py` 仍可使用，但课程参数依赖硬编码对照表，可能不准确。
 
 ### 3. 运行抢课（循环模式，捡漏专用）
 
@@ -226,7 +235,8 @@ python tools/input_cookie.py
 | 工具 | 说明 |
 |------|------|
 | `tools/get_batch_code.py` | 连接选课系统获取当前可用的选课批次代码 |
-| `tools/query_course.py` | 按关键字搜索课程，查看课程 ID 等信息 |
+| `tools/query_course_v2.py` | **（推荐）** 按关键字搜索课程，课程参数从平台动态获取 |
+| `tools/query_course.py` | 按关键字搜索课程（旧版，依赖硬编码对照表） |
 | `tools/input_cookie.py` | 从浏览器手动复制 Cookie/Token 写入缓存 |
 | `tools/course_decrypt.py` | 解密选课请求的 AES 加密 Payload，用于调试 |
 

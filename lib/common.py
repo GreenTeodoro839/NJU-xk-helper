@@ -80,12 +80,19 @@ def load_course_conf() -> Tuple[str, List[Tuple[str, str, str, str]]]:
 
 
 def save_course_conf(elective_batch_code: str, courses: List[Tuple[str, str, str, str]]) -> None:
-    """保存 course.conf。"""
-    data = {
-        "electiveBatchCode": str(elective_batch_code).strip(),
-        "courses": [[c[0], c[1], c[2], c[3]] for c in courses],
-    }
-    save_json_atomic(COURSE_CONF_FILE, data)
+    """保存 course.conf，保持每门课一行的紧凑格式。"""
+    batch = json.dumps(str(elective_batch_code).strip(), ensure_ascii=False)
+    lines = ["{", f'  "electiveBatchCode": {batch},', '  "courses": [']
+    for i, c in enumerate(courses):
+        row = json.dumps([c[0], c[1], c[2], c[3]], ensure_ascii=False)
+        comma = "," if i < len(courses) - 1 else ""
+        lines.append(f"    {row}{comma}")
+    lines.extend(["  ]", "}"])
+
+    tmp_path = COURSE_CONF_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp_path, COURSE_CONF_FILE)
 
 
 def remove_course_from_conf(course: Tuple[str, str, str, str]) -> bool:

@@ -175,9 +175,10 @@ def main() -> None:
 
             # 解析结果
             msg = res_json.get("msg") if isinstance(res_json, dict) else None
+            code = res_json.get("code") if isinstance(res_json, dict) else None
 
-            if msg == "该课程超过课容量":
-                print("    >>> 该课程超过课容量，继续运行...")
+            if msg == "该课程超过课容量" or code == "#E2140600091":
+                print("    >>> 课程已满（容量不足），继续运行...")
 
             elif msg in (None, "", "null"):
                 now_str = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -209,7 +210,7 @@ def main() -> None:
                 else:
                     print(f"    >>> 返回(非JSON): {str(raw)[:200]}...")
 
-            time.sleep(random.uniform(1, 3))
+            time.sleep(random.uniform(1, 2))
 
         # 每轮结束检查
         try:
@@ -220,7 +221,7 @@ def main() -> None:
         except Exception:
             return
 
-        sleep_s = random.uniform(30, 90)
+        sleep_s = random.uniform(5, 10)
         print(f"\n>>> 本轮结束，休息 {sleep_s:.1f}s 后进入下一轮...")
         time.sleep(sleep_s)
 

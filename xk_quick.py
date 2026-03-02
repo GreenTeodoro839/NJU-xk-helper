@@ -42,6 +42,14 @@ def _load_session_cache() -> Tuple[Dict[str, str], str]:
     return data.get("cookies", {}), token
 
 
+def _try_int(val):
+    """纯数字字符串转 int，与浏览器前端 JSON 类型保持一致。"""
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return val
+
+
 def _do_select_one_task(
     student_code: str,
     elective_batch_code: str,
@@ -60,7 +68,7 @@ def _do_select_one_task(
             "studentCode": student_code,
             "electiveBatchCode": elective_batch_code,
             "teachingClassId": course[0],
-            "courseKind": course[1],
+            "courseKind": _try_int(course[1]),
             "teachingClassType": course[2],
         }
     }
@@ -70,7 +78,10 @@ def _do_select_one_task(
             TARGET_URL,
             cookies=session_cookies,
             headers=headers,
-            data={"addParam": encrypt_add_param(payload)},
+            data={
+                "addParam": encrypt_add_param(payload),
+                "studentCode": student_code,
+            },
             proxies=proxies,
             verify=False,
             timeout=15,

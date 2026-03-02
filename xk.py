@@ -39,6 +39,14 @@ def _is_illegal_request(res_json: Dict[str, Any] | None, raw_text: str) -> bool:
     return "非法请求" in (raw_text or "")
 
 
+def _try_int(val):
+    """纯数字字符串转 int，与浏览器前端 JSON 类型保持一致。"""
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return val
+
+
 def _do_select_one(
     *,
     student_code: str,
@@ -55,7 +63,7 @@ def _do_select_one(
             "studentCode": student_code,
             "electiveBatchCode": elective_batch_code,
             "teachingClassId": course[0],
-            "courseKind": course[1],
+            "courseKind": _try_int(course[1]),
             "teachingClassType": course[2],
         }
     }
@@ -64,7 +72,10 @@ def _do_select_one(
         TARGET_URL,
         cookies=session_cookies,
         headers=headers,
-        data={"addParam": encrypt_add_param(payload)},
+        data={
+            "addParam": encrypt_add_param(payload),
+            "studentCode": student_code,
+        },
         proxies=proxies,
         verify=False,
         timeout=10,
@@ -177,8 +188,8 @@ def main() -> None:
             msg = res_json.get("msg") if isinstance(res_json, dict) else None
             code = res_json.get("code") if isinstance(res_json, dict) else None
 
-            if msg == "该课程超过课容量" or code == "#E2140600091":
-                print("    >>> 课程已满（容量不足），继续运行...")
+            if msg == "该课程超过课容量":
+                print(f"    >>> 课程已满（容量不足），继续运行...")
 
             elif msg in (None, "", "null"):
                 now_str = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -210,7 +221,7 @@ def main() -> None:
                 else:
                     print(f"    >>> 返回(非JSON): {str(raw)[:200]}...")
 
-            time.sleep(random.uniform(1, 2))
+            time.sleep(random.uniform(0.5, 1.2))
 
         # 每轮结束检查
         try:
@@ -221,7 +232,7 @@ def main() -> None:
         except Exception:
             return
 
-        sleep_s = random.uniform(5, 10)
+        sleep_s = random.uniform(3, 8)
         print(f"\n>>> 本轮结束，休息 {sleep_s:.1f}s 后进入下一轮...")
         time.sleep(sleep_s)
 

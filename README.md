@@ -41,6 +41,7 @@
     ├── get_batch_code.py     # 获取选课批次代码
     ├── query_course.py       # 课程查询工具（按关键字搜索）
     ├── query_course_v2.py    # 课程查询工具 v2（动态获取参数，推荐）
+    ├── import_favorites.py   # 从收藏列表导入课程到 course.conf
     ├── input_cookie.py       # 手动导入浏览器 Cookie
     └── course_decrypt.py     # AES Payload 解密工具
 ```
@@ -136,13 +137,19 @@ pip install onnxruntime pillow numpy requests pycryptodome serverchan-sdk pysock
 
 > **如何获取课程参数？**
 >
-> **方法一（推荐）**：使用课程查询工具 v2，课程参数从平台动态获取，无需依赖硬编码对照表：
+> **方法一（最省心）**：先在选课平台网页上收藏想抢的课程，然后一键导入：
+>
+> ```bash
+> python tools/import_favorites.py
+> ```
+>
+> **方法二（推荐）**：使用课程查询工具 v2，课程参数从平台动态获取，无需依赖硬编码对照表：
 >
 > ```bash
 > python tools/query_course_v2.py
 > ```
 >
-> **方法一（旧版）**：使用课程查询工具搜索课程名（依赖硬编码对照表）：
+> **方法二（旧版）**：使用课程查询工具搜索课程名（依赖硬编码对照表）：
 >
 > ```bash
 > python tools/query_course.py
@@ -188,7 +195,18 @@ python tools/get_batch_code.py
 
 运行后自动将 `electiveBatchCode` 写入 `config/course.conf`。
 
-### 2. 查询课程 ID（推荐 v2）
+### 2. 导入收藏课程（最省心）
+
+先在选课平台网页上把想抢的课程加入收藏，然后运行：
+
+```bash
+python tools/import_favorites.py          # 交互式选择导入
+python tools/import_favorites.py --all    # 一键导入全部收藏
+```
+
+脚本会自动登录 → 拉取你的收藏列表 → 展示课程详情 → 选择后写入 `course.conf`。已在配置中的课程会自动标记并跳过。
+
+### 3. 查询课程 ID（推荐 v2）
 
 ```bash
 python tools/query_course_v2.py
@@ -198,7 +216,7 @@ v2 版本会自动从选课平台获取 courseKind / teachingClassType 映射，
 
 > 旧版 `python tools/query_course.py` 仍可使用，但课程参数依赖硬编码对照表，可能不准确。
 
-### 3. 运行抢课（循环模式，捡漏专用）
+### 4. 运行抢课（循环模式，捡漏专用）
 
 ```bash
 python xk.py
@@ -206,7 +224,7 @@ python xk.py
 
 脚本会自动登录 → 循环请求选课接口 → 抢到后推送通知并从 `course.conf` 移除 → 直到全部抢完或手动终止。
 
-### 4. 运行抢课（并发模式）
+### 5. 运行抢课（并发模式）
 
 ```bash
 python xk_quick.py
@@ -214,7 +232,7 @@ python xk_quick.py
 
 适合选课系统刚开放时使用，多线程并发提交提高成功率。
 
-### 5. 手动导入 Session（备用）
+### 6. 手动导入 Session（备用）
 
 如果自动登录遇到困难，可以手动从浏览器复制 Cookie 和 Token：
 
@@ -235,6 +253,7 @@ python tools/input_cookie.py
 | 工具 | 说明 |
 |------|------|
 | `tools/get_batch_code.py` | 连接选课系统获取当前可用的选课批次代码 |
+| `tools/import_favorites.py` | **（最省心）** 从选课平台收藏列表一键导入课程，自动跳过已有课程 |
 | `tools/query_course_v2.py` | **（推荐）** 按关键字搜索课程，课程参数从平台动态获取 |
 | `tools/query_course.py` | 按关键字搜索课程（旧版，依赖硬编码对照表） |
 | `tools/input_cookie.py` | 从浏览器手动复制 Cookie/Token 写入缓存 |

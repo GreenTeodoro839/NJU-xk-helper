@@ -188,12 +188,9 @@ def main() -> None:
             msg = res_json.get("msg") if isinstance(res_json, dict) else None
             code = res_json.get("code") if isinstance(res_json, dict) else None
 
-            if msg == "该课程超过课容量":
-                print(f"    >>> 课程已满（容量不足），继续运行...")
-
-            elif msg in (None, "", "null"):
+            if str(code) == "1" and msg in (None, "", "null"):
                 now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-                print(f"    ✅ 选课成功（msg为空）: {class_id} ({ctype}) @ {now_str}")
+                print(f"    ✅ 选课成功: {class_id} ({ctype}) @ {now_str}")
 
                 desp = (f"teachingClassId: {class_id}\ncourseKind: {kind}\n"
                         f"teachingClassType: {ctype}\ntime: {now_str}")

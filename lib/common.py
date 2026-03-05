@@ -165,3 +165,71 @@ def clear_env_proxies():
     """清除系统代理环境变量，防止 V2RayN 等工具注入的代理劫持流量。"""
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
         os.environ.pop(var, None)
+
+
+# ================= 选课结果轮询 =================
+
+STUDENT_STATUS_URL = "https://xk.nju.edu.cn/xsxkapp/sys/xsxkapp/elective/studentstatus.do"
+
+
+def poll_process_result(
+    student_code: str,
+    teaching_class_id: str,
+    session_cookies: Dict[str, str],
+    headers: Dict[str, str],
+    proxies: Dict[str, str] | None = None,
+    *,
+    op_type: str = "1",
+    max_attempts: int = 10,
+    interval: float = 1.0,
+) -> Dict[str, Any]:
+    """轮询 studentstatus.do 获取选课操作的真正结果。
+
+    前端 initProcessInterval / queryOperateProcess 的 Python 等价实现。
+    volunteer.do 返回 code="1" 只表示请求已入队，真正的成功/失败
+    需要通过此接口轮询获取。
+
+    返回格式: {"code": "1"/"−1"/"timeout", "msg": "..."}
+      - code "1"  → 操作成功
+      - code "-1" → 操作失败（msg 包含原因）
+      - code "timeout" → 轮询超时
+      - code "error" → 请求异常
+    """
+    import requests as _requests
+
+    payload = {
+        "studentCode": student_code,
+        "teachingClassId": teaching_class_id,
+        "type": op_type,
+    }
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = _requests.post(
+                STUDENT_STATUS_URL,
+                cookies=session_cookies,
+                headers=headers,
+                data=payload,
+                proxies=proxies,
+                verify=False,
+                timeout=10,
+            )
+            r.encoding = "utf-8"
+            data = r.json()
+            code = str(data.get("code", ""))
+
+            if code == "0":
+                # 仍在处理中
+                time.sleep(interval)
+                continue
+            elif code in ("1", "-1"):
+                # 完成（成功或失败）
+                return {"code": code, "msg": data.get("msg", "")}
+            else:
+                # 意外 code
+                return {"code": code, "msg": data.get("msg", "")}
+
+        except Exception as e:
+            return {"code": "error", "msg": str(e)}
+
+    return {"code": "timeout", "msg": f"轮询 {max_attempts} 次仍未完成"}

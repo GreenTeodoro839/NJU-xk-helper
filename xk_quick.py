@@ -26,6 +26,7 @@ from lib.common import (
     build_headers,
     build_proxies,
     clear_env_proxies,
+    poll_process_result,
 )
 from lib.serverchan import send_serverchan_notification
 
@@ -141,26 +142,49 @@ def main():
                     continue
 
                 res_json = res.get("json")
+                code = str(res_json.get("code", "")) if isinstance(res_json, dict) else ""
                 msg = str(res_json.get("msg", "")) if isinstance(res_json, dict) else ""
 
-                if msg in ("null", "None", "") and isinstance(res_json, dict):
-                    now_str = time.strftime("%H:%M:%S")
-                    print(f"    🎉 [抢到了!] {cid} @ {now_str}")
-                    remark = course[3] if len(course) >= 4 else ""
-                    desp = f"ID: {cid}\n{now_str}"
-                    if remark:
-                        desp += f"\n备注: {remark}"
-                    send_serverchan_notification(f"选课成功: {cid}", desp)
-                    succeeded.append(course)
+                if code == "1":
+                    # volunteer.do 返回 code="1" 只表示请求已入队
+                    # 需要轮询 studentstatus.do 获取真正结果
+                    print(f"    ⏳ [{cid}] 请求已提交，轮询处理结果...")
+                    poll = poll_process_result(
+                        student_code=student_code,
+                        teaching_class_id=cid,
+                        session_cookies=session_cookies,
+                        headers=headers,
+                        proxies=proxies,
+                    )
+                    poll_code = str(poll.get("code", ""))
+                    poll_msg = poll.get("msg", "")
+
+                    if poll_code == "1":
+                        now_str = time.strftime("%H:%M:%S")
+                        print(f"    🎉 [抢到了!] {cid} @ {now_str}")
+                        if poll_msg:
+                            print(f"       服务器消息: {poll_msg}")
+                        remark = course[3] if len(course) >= 4 else ""
+                        desp = f"ID: {cid}\n{now_str}"
+                        if remark:
+                            desp += f"\n备注: {remark}"
+                        send_serverchan_notification(f"选课成功: {cid}", desp)
+                        succeeded.append(course)
+                    elif poll_code == "-1":
+                        print(f"    [选课失败] {cid}: {poll_msg}")
+                    elif poll_code == "timeout":
+                        print(f"    [轮询超时] {cid}: {poll_msg}")
+                    else:
+                        print(f"    [未知状态] {cid}: code={poll_code}, msg={poll_msg}")
+
+                elif code == "302":
+                    print(f"    [会话过期] {cid}")
 
                 elif "NullPointer" in msg:
                     print(f"    [服务器繁忙] {cid} (NPE重试)")
 
-                elif "超过课容量" in msg:
-                    print(f"    [满员] {cid}")
-
                 else:
-                    print(f"    [其他] {cid}: {msg}")
+                    print(f"    [拒绝] {cid}: {msg}")
 
         if succeeded:
             courses_to_run = [c for c in courses_to_run if c not in succeeded]

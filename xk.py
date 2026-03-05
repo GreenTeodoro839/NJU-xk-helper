@@ -24,6 +24,7 @@ from lib.common import (
     build_headers,
     build_proxies,
     clear_env_proxies,
+    poll_process_result,
 )
 from lib.session_manager import acquire_session
 from lib.serverchan import send_serverchan_notification
@@ -184,33 +185,62 @@ def main() -> None:
                     time.sleep(random.uniform(1, 3))
                     continue
 
-            # 解析结果
+            # 解析结果 —— 两步判断，与前端 initProcessInterval 逻辑一致
             msg = res_json.get("msg") if isinstance(res_json, dict) else None
             code = res_json.get("code") if isinstance(res_json, dict) else None
 
-            if str(code) == "1" and msg in (None, "", "null"):
-                now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-                print(f"    ✅ 选课成功: {class_id} ({ctype}) @ {now_str}")
+            if str(code) == "1":
+                # volunteer.do 返回 code="1" 只表示请求已入队
+                # 需要轮询 studentstatus.do 获取真正结果
+                print(f"    ⏳ 请求已提交，轮询处理结果...")
+                poll = poll_process_result(
+                    student_code=student_code,
+                    teaching_class_id=class_id,
+                    session_cookies=session_cookies,
+                    headers=headers,
+                    proxies=proxies,
+                )
+                poll_code = str(poll.get("code", ""))
+                poll_msg = poll.get("msg", "")
 
-                desp = (f"teachingClassId: {class_id}\ncourseKind: {kind}\n"
-                        f"teachingClassType: {ctype}\ntime: {now_str}")
-                if remark:
-                    desp += f"\n备注: {remark}"
-                send_serverchan_notification("✅ 选课成功", desp)
+                if poll_code == "1":
+                    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"    ✅ 选课成功: {class_id} ({ctype}) @ {now_str}")
+                    if poll_msg:
+                        print(f"       服务器消息: {poll_msg}")
 
-                if remove_course_from_conf(course):
-                    print("    >>> 已从 course.conf 删除该课程")
-                else:
-                    print("    !!! 选课成功但未能从 course.conf 删除")
+                    desp = (f"teachingClassId: {class_id}\ncourseKind: {kind}\n"
+                            f"teachingClassType: {ctype}\ntime: {now_str}")
+                    if remark:
+                        desp += f"\n备注: {remark}"
+                    send_serverchan_notification("✅ 选课成功", desp)
 
-                # 检查是否全部完成
-                try:
-                    _, left = load_course_conf()
-                    if not left:
-                        print(">>> 所有课程已完成，退出。")
+                    if remove_course_from_conf(course):
+                        print("    >>> 已从 course.conf 删除该课程")
+                    else:
+                        print("    !!! 选课成功但未能从 course.conf 删除")
+
+                    # 检查是否全部完成
+                    try:
+                        _, left = load_course_conf()
+                        if not left:
+                            print(">>> 所有课程已完成，退出。")
+                            return
+                    except Exception:
                         return
-                except Exception:
-                    return
+
+                elif poll_code == "-1":
+                    print(f"    ❌ 选课失败: {poll_msg}")
+                elif poll_code == "timeout":
+                    print(f"    ⚠️ 轮询超时，未能确认结果: {poll_msg}")
+                else:
+                    print(f"    ⚠️ 轮询返回未知状态: code={poll_code}, msg={poll_msg}")
+
+            elif str(code) == "302":
+                print("    ⚠️ 会话已过期(302)，将在下一轮重新获取凭证")
+                session_cookies, token = acquire_session()
+                if session_cookies and token:
+                    headers = build_headers(token)
 
             else:
                 if res_json is not None:

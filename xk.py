@@ -34,10 +34,23 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 TARGET_URL = "https://xk.nju.edu.cn/xsxkapp/sys/xsxkapp/elective/volunteer.do"
 
 
-def _is_illegal_request(res_json: Dict[str, Any] | None, raw_text: str) -> bool:
-    if res_json and "非法请求" in str(res_json.get("msg", "")):
+def _is_session_expired(res_json: Dict[str, Any] | None) -> bool:
+    """与前端 bh_utils.js / grablessons.min.js 保持一致的登录失效检测。
+
+    前端两种判定方式:
+    1. resp.loginURL 存在且非空  (bh_utils.js doAjax)
+    2. resp.code == "302"         (grablessons.min.js)
+    """
+    if not isinstance(res_json, dict):
+        return False
+    # 主要判定：loginURL
+    login_url = res_json.get("loginURL")
+    if login_url:  # not None / not ""
         return True
-    return "非法请求" in (raw_text or "")
+    # 次要判定：code == "302"
+    if str(res_json.get("code", "")) == "302":
+        return True
+    return False
 
 
 def _try_int(val):
@@ -161,9 +174,9 @@ def main() -> None:
                 time.sleep(random.uniform(1, 3))
                 continue
 
-            # 登录失效检测与重试
-            if _is_illegal_request(res_json, raw):
-                print("    ⚠️ 检测到'非法请求'，重新获取登录凭证...")
+            # 登录失效检测与重试（与前端 loginURL / code=302 逻辑一致）
+            if _is_session_expired(res_json):
+                print("    ⚠️ 检测到登录失效（loginURL/302），重新获取登录凭证...")
                 session_cookies, token = acquire_session()
                 if not (session_cookies and token):
                     print("    ❌ 重新获取登录凭证失败，跳过本次")
@@ -235,12 +248,6 @@ def main() -> None:
                     print(f"    ⚠️ 轮询超时，未能确认结果: {poll_msg}")
                 else:
                     print(f"    ⚠️ 轮询返回未知状态: code={poll_code}, msg={poll_msg}")
-
-            elif str(code) == "302":
-                print("    ⚠️ 会话已过期(302)，将在下一轮重新获取凭证")
-                session_cookies, token = acquire_session()
-                if session_cookies and token:
-                    headers = build_headers(token)
 
             else:
                 if res_json is not None:

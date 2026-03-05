@@ -2,6 +2,12 @@
 
 多线程并发提交选课请求，适合开放选课瞬间抢课。
 需要先通过 xk.py 或 tools/input_cookie.py 生成 session_cache.json。
+
+速率控制策略：
+  - 全局令牌桶限制约 2~3 req/s（单次请求间隔 ≥0.35s）
+  - 并发数限制为 3，利用 I/O 重叠加速而非暴力并发
+  - 检测到 QoS（NPE/网络错误）时指数退避，最长 15s
+  - 轮间间隔 2~4s，触发 QoS 后自动拉长
 """
 
 import json
@@ -9,6 +15,7 @@ import os
 import random
 import sys
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Tuple
 
@@ -33,6 +40,50 @@ from lib.serverchan import send_serverchan_notification
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 TARGET_URL = "https://xk.nju.edu.cn/xsxkapp/sys/xsxkapp/elective/volunteer.do"
+
+# ===== 速率控制 =====
+MAX_WORKERS = 3            # 并发线程数（利用I/O重叠，不暴力并发）
+MIN_INTERVAL = 0.35        # 全局最小请求间隔(秒)，约 2.8 req/s
+BASE_ROUND_DELAY = (2, 4)  # 轮间随机延迟(秒)
+QOS_BACKOFF_BASE = 3.0     # QoS 退避基础(秒)
+QOS_BACKOFF_MAX = 15.0     # QoS 退避上限(秒)
+
+
+class _RateLimiter:
+    """简易令牌桶：保证全局请求间隔 ≥ min_interval 秒。"""
+
+    def __init__(self, min_interval: float):
+        self._min_interval = min_interval
+        self._lock = threading.Lock()
+        self._last_time = 0.0
+
+    def acquire(self):
+        with self._lock:
+            now = time.monotonic()
+            wait = self._last_time + self._min_interval - now
+            if wait > 0:
+                time.sleep(wait)
+            self._last_time = time.monotonic()
+
+
+_rate_limiter = _RateLimiter(MIN_INTERVAL)
+
+
+def _is_session_expired(res_json: Dict[str, Any] | None) -> bool:
+    """与前端 bh_utils.js / grablessons.min.js 保持一致的登录失效检测。
+
+    前端两种判定方式:
+    1. resp.loginURL 存在且非空  (bh_utils.js doAjax)
+    2. resp.code == "302"         (grablessons.min.js)
+    """
+    if not isinstance(res_json, dict):
+        return False
+    login_url = res_json.get("loginURL")
+    if login_url:
+        return True
+    if str(res_json.get("code", "")) == "302":
+        return True
+    return False
 
 
 def _load_session_cache() -> Tuple[Dict[str, str], str]:
@@ -60,8 +111,8 @@ def _do_select_one_task(
     proxies: Dict[str, str] | None,
 ) -> Dict[str, Any]:
     """单个线程执行的选课任务。"""
-    # 微小抖动避免同一瞬间击穿后端
-    time.sleep(random.uniform(0.01, 0.1))
+    # 通过全局令牌桶控速
+    _rate_limiter.acquire()
 
     payload = {
         "data": {
@@ -109,11 +160,14 @@ def main():
 
         elective_batch_code, courses_to_run = load_course_conf()
         print(f">>> 启动成功：内存加载 {len(courses_to_run)} 门课程")
+        print(f">>> 速率控制: {MAX_WORKERS} 并发, 最小间隔 {MIN_INTERVAL}s (~{1/MIN_INTERVAL:.1f} req/s)")
     except Exception as e:
         print(f"❌ 初始化失败: {e}")
         return
 
     round_no = 0
+    qos_hit_count = 0  # 连续 QoS 触发次数，用于指数退避
+
     while courses_to_run:
         session_cookies, token = _load_session_cache()
         headers = build_headers(token)
@@ -121,8 +175,10 @@ def main():
         print(f"\n===== 第 {round_no} 轮 ({len(courses_to_run)} 门) =====")
 
         succeeded = []
+        round_qos = False      # 本轮是否检测到 QoS
+        session_expired = False # 本轮是否检测到登录失效
 
-        with ThreadPoolExecutor(max_workers=min(len(courses_to_run), 15)) as executor:
+        with ThreadPoolExecutor(max_workers=min(len(courses_to_run), MAX_WORKERS)) as executor:
             futures = [
                 executor.submit(
                     _do_select_one_task,
@@ -139,11 +195,26 @@ def main():
 
                 if not res["success"]:
                     print(f"    [网络错误] {cid}: {res.get('error')}")
+                    round_qos = True
                     continue
 
                 res_json = res.get("json")
-                code = str(res_json.get("code", "")) if isinstance(res_json, dict) else ""
-                msg = str(res_json.get("msg", "")) if isinstance(res_json, dict) else ""
+
+                # 非 JSON 响应
+                if res_json is None:
+                    raw = res.get("raw", "")
+                    print(f"    [非JSON响应] {cid}: {str(raw)[:200]}...")
+                    round_qos = True
+                    continue
+
+                # 登录失效检测（与前端 loginURL / code=302 逻辑一致）
+                if _is_session_expired(res_json):
+                    print(f"    [会话过期] {cid}: 检测到 loginURL/302")
+                    session_expired = True
+                    continue
+
+                code = str(res_json.get("code", ""))
+                msg = str(res_json.get("msg", ""))
 
                 if code == "1":
                     # volunteer.do 返回 code="1" 只表示请求已入队
@@ -164,33 +235,56 @@ def main():
                         print(f"    🎉 [抢到了!] {cid} @ {now_str}")
                         if poll_msg:
                             print(f"       服务器消息: {poll_msg}")
-                        remark = course[3] if len(course) >= 4 else ""
-                        desp = f"ID: {cid}\n{now_str}"
+                        class_id, kind, ctype, remark = course
+                        desp = (f"teachingClassId: {class_id}\ncourseKind: {kind}\n"
+                                f"teachingClassType: {ctype}\ntime: {now_str}")
                         if remark:
                             desp += f"\n备注: {remark}"
                         send_serverchan_notification(f"选课成功: {cid}", desp)
                         succeeded.append(course)
                     elif poll_code == "-1":
-                        print(f"    [选课失败] {cid}: {poll_msg}")
+                        print(f"    ❌ [选课失败] {cid}: {poll_msg}")
                     elif poll_code == "timeout":
-                        print(f"    [轮询超时] {cid}: {poll_msg}")
+                        print(f"    ⚠️ [轮询超时] {cid}: {poll_msg}")
                     else:
-                        print(f"    [未知状态] {cid}: code={poll_code}, msg={poll_msg}")
-
-                elif code == "302":
-                    print(f"    [会话过期] {cid}")
-
-                elif "NullPointer" in msg:
-                    print(f"    [服务器繁忙] {cid} (NPE重试)")
+                        print(f"    ⚠️ [轮询未知状态] {cid}: code={poll_code}, msg={poll_msg}")
 
                 else:
-                    print(f"    [拒绝] {cid}: {msg}")
+                    # 非 code=1 的情况，打印完整返回方便调试
+                    if "NullPointer" in msg:
+                        print(f"    [服务器繁忙/QoS] {cid} (NPE)")
+                        round_qos = True
+                    else:
+                        print(f"    >>> [{cid}] 返回: {res_json}")
 
         if succeeded:
             courses_to_run = [c for c in courses_to_run if c not in succeeded]
             print(f"    >>> 本轮抢到 {len(succeeded)} 门")
 
-        time.sleep(random.uniform(0.1, 0.8))
+        # 登录失效：重新加载 session_cache 后立即重试，不等待
+        if session_expired:
+            print("    ⚠️ 本轮检测到会话过期，重新加载 session_cache.json...")
+            try:
+                session_cookies, token = _load_session_cache()
+                headers = build_headers(token)
+                print(f"    >>> 凭证已刷新，Token: {str(token)[:10]}...")
+            except Exception as e:
+                print(f"    ❌ 重新加载凭证失败: {e}")
+            time.sleep(random.uniform(0.5, 1.5))
+            continue
+
+        # 自适应轮间延迟
+        if round_qos:
+            qos_hit_count += 1
+            backoff = min(QOS_BACKOFF_BASE * (2 ** (qos_hit_count - 1)), QOS_BACKOFF_MAX)
+            jitter = random.uniform(0, backoff * 0.3)
+            delay = backoff + jitter
+            print(f"    ⚠️ 检测到 QoS/繁忙，退避 {delay:.1f}s (第 {qos_hit_count} 次)")
+        else:
+            qos_hit_count = max(0, qos_hit_count - 1)  # 成功一轮，逐步恢复
+            delay = random.uniform(*BASE_ROUND_DELAY)
+
+        time.sleep(delay)
 
     print(">>> ✅ 全部完成，退出。")
 

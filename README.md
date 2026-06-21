@@ -39,8 +39,7 @@
 │   └── common.py             # 共享工具（配置加载、AES加密、请求头等）
 └── tools/
     ├── get_batch_code.py     # 获取选课批次代码
-    ├── query_course.py       # 课程查询工具（按关键字搜索）
-    ├── query_course_v2.py    # 课程查询工具 v2（动态获取参数，推荐）
+    ├── query_course_v2.py    # 课程查询工具（动态获取参数，按关键字搜索）
     ├── import_favorites.py   # 从收藏列表导入课程到 course.conf
     ├── input_cookie.py       # 手动导入浏览器 Cookie
     └── course_decrypt.py     # AES Payload 解密工具
@@ -143,19 +142,13 @@ pip install onnxruntime pillow numpy requests pycryptodome serverchan-sdk pysock
 > python tools/import_favorites.py
 > ```
 >
-> **方法二（推荐）**：使用课程查询工具 v2，课程参数从平台动态获取，无需依赖硬编码对照表：
+> **方法二（推荐）**：使用课程查询工具，课程参数从平台动态获取，无需依赖硬编码对照表：
 >
 > ```bash
 > python tools/query_course_v2.py
 > ```
 >
-> **方法二（旧版）**：使用课程查询工具搜索课程名（依赖硬编码对照表）：
->
-> ```bash
-> python tools/query_course.py
-> ```
->
-> **方法二**：在浏览器选课页面按 F12，Network 面板中找到 `volunteer.do` 请求，复制 Payload 中的 addParam，用解密工具查看：
+> **方法三**：在浏览器选课页面按 F12，Network 面板中找到 `volunteer.do` 请求，复制 Payload 中的 addParam，用解密工具查看：
 > ```bash
 > python tools/course_decrypt.py
 > ```
@@ -187,13 +180,15 @@ pip install onnxruntime pillow numpy requests pycryptodome serverchan-sdk pysock
 
 ## 使用方法
 
-### 1. 获取选课批次代码
+### 1. 获取选课批次代码（必做的第一步）
 
 ```bash
 python tools/get_batch_code.py
 ```
 
 运行后自动将 `electiveBatchCode` 写入 `config/course.conf`。
+
+> ⚠️ 后续的查询课程、导入收藏、抢课都依赖 `electiveBatchCode`，**务必先完成这一步**。`electiveBatchCode` 会随选课批次变化，每个新批次开始前都要重新获取一次。
 
 ### 2. 导入收藏课程（最省心）
 
@@ -206,15 +201,15 @@ python tools/import_favorites.py --all    # 一键导入全部收藏
 
 脚本会自动登录 → 拉取你的收藏列表 → 展示课程详情 → 选择后写入 `course.conf`。已在配置中的课程会自动标记并跳过。
 
-### 3. 查询课程 ID（推荐 v2）
+### 3. 查询课程 ID
+
+> ⚠️ **前置条件**：运行前 `config/course.conf` 必须已有 `electiveBatchCode`，请先完成上面的「1. 获取选课批次代码」，否则脚本会报错退出。
 
 ```bash
 python tools/query_course_v2.py
 ```
 
-v2 版本会自动从选课平台获取 courseKind / teachingClassType 映射，不依赖硬编码对照表。输入课程名或教师名搜索，支持翻页（`u`/`d`），输入编号查看课程 ID，然后按提示直接写入或手动填写 `config/course.conf`。
-
-> 旧版 `python tools/query_course.py` 仍可使用，但课程参数依赖硬编码对照表，可能不准确。
+会自动从选课平台获取 courseKind / teachingClassType 映射，不依赖硬编码对照表。输入课程名或教师名搜索，支持翻页（`u`/`d`），输入编号查看课程 ID，然后按提示直接写入或手动填写 `config/course.conf`。
 
 ### 4. 运行抢课（循环模式，捡漏专用）
 
@@ -254,8 +249,7 @@ python tools/input_cookie.py
 |------|------|
 | `tools/get_batch_code.py` | 连接选课系统获取当前可用的选课批次代码 |
 | `tools/import_favorites.py` | **（最省心）** 从选课平台收藏列表一键导入课程，自动跳过已有课程 |
-| `tools/query_course_v2.py` | **（推荐）** 按关键字搜索课程，课程参数从平台动态获取 |
-| `tools/query_course.py` | 按关键字搜索课程（旧版，依赖硬编码对照表） |
+| `tools/query_course_v2.py` | 按关键字搜索课程，课程参数从平台动态获取 |
 | `tools/input_cookie.py` | 从浏览器手动复制 Cookie/Token 写入缓存 |
 | `tools/course_decrypt.py` | 解密选课请求的 AES 加密 Payload，用于调试 |
 

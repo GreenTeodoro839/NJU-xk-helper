@@ -39,13 +39,17 @@ PAGE_SIZE = 10
 
 # ===================== 动态参数映射 =====================
 
-def fetch_jxblx_map(student_code, cookies, token, proxies):
-    """从学生信息接口获取 limitMenuList，动态构建 jxblx → (courseKind, teachingClassType, 类别名) 映射。
+def fetch_student_context(student_code, cookies, token, proxies):
+    """从学生信息接口获取 (jxblx_map, student_major)。
+
+    - jxblx_map: jxblx → (courseKind, teachingClassType, 类别名)，来自 limitMenuList
+      数据路径: data.electiveBatchList[].limitMenuList[]
+      每条 limitMenu 含: courseKind, menuCode (即 teachingClassType), menuName
+      courseKind 可能是逗号分隔的组合值（如 "6,7"），需拆分作为多个 jxblx 键。
+    - student_major: 学生本人专业代码（data.major），用于跨专业纠正（见 classify_course）。
 
     接口: /student/{studentCode}.do
-    数据路径: data.electiveBatchList[].limitMenuList[]
-    每条 limitMenu 含: courseKind, menuCode (即 teachingClassType), menuName
-    courseKind 可能是逗号分隔的组合值（如 "6,7"），需拆分作为多个 jxblx 键。
+    失败返回 (None, None)。
     """
     url = f"{STUDENT_URL}/{student_code}.do"
     headers = build_headers(token)
@@ -56,12 +60,15 @@ def fetch_jxblx_map(student_code, cookies, token, proxies):
         data = r.json()
     except Exception as e:
         print(f"❌ 获取学生信息失败: {e}")
-        return None
+        return None, None
 
-    batch_list = data.get("data", {}).get("electiveBatchList", [])
+    info = data.get("data", {}) or {}
+    student_major = str(info.get("major") or info.get("selectMajor") or "").strip()
+
+    batch_list = info.get("electiveBatchList", [])
     if not batch_list:
         print("❌ 学生信息中未找到选课批次（electiveBatchList）")
-        return None
+        return None, None
 
     jxblx_map = {}
     for batch in batch_list:
@@ -80,9 +87,9 @@ def fetch_jxblx_map(student_code, cookies, token, proxies):
 
     if not jxblx_map:
         print("❌ 未能从 limitMenuList 构建映射（列表为空或格式异常）")
-        return None
+        return None, None
 
-    return jxblx_map
+    return jxblx_map, student_major
 
 
 def lookup_kind_type(jxblx, jxblx_map):
@@ -92,6 +99,32 @@ def lookup_kind_type(jxblx, jxblx_map):
     if entry:
         return entry
     return (jxblx, "??", "未知类别")
+
+
+def classify_course(course, jxblx_map, student_major):
+    """判定该课程对【本学生】的真实选课类别，返回 (courseKind, teachingClassType, 类别名)。
+
+    queryCourse.do 是全局搜索，返回的 jxblx 是课程在【开课院系自身】视角下的类别：
+      - 公选/公共课：院系类别即公选，jxblx 正确 → 判对
+      - 本人专业课：院系类别即专业，jxblx 正确 → 判对
+      - 跨专业课：在开课院系眼里同样是"专业课"(jxblx=1)，会被误判成 ZY；
+        但对本学生而言必须按跨专业(KZY/courseKind=12)选，否则报名失败。
+
+    纠正规则（已由网页报名请求解密验证）：
+      若 jxblx 判为专业(ZY)、但学生本人专业不在该课 schoolClassMapDetailKzy
+      （可选修该课的专业列表）中，则对本学生而言是跨专业(KZY/12)。
+    """
+    kind, ctype, name = lookup_kind_type(course.get("jxblx", "?"), jxblx_map)
+
+    # 仅对"被判为专业(ZY)"的课程做跨专业纠正；公选等其它类别不动
+    if ctype == "ZY" and student_major:
+        kzy_list = course.get("schoolClassMapDetailKzy") or []
+        native_majors = {str(d.get("major")) for d in kzy_list if d.get("major")}
+        # 有明确的可选专业列表、且本人专业不在其中 → 跨专业
+        if native_majors and student_major not in native_majors:
+            return jxblx_map.get("12") or ("12", "KZY", "跨专业")
+
+    return (kind, ctype, name)
 
 
 # ===================== 配置加载 =====================
@@ -185,7 +218,7 @@ def query_courses(keyword, page_number, student_code, batch_code, cookies, token
 
 # ===================== 展示 =====================
 
-def display_page(courses, page_number, is_last, keyword, jxblx_map):
+def display_page(courses, page_number, is_last, keyword, jxblx_map, student_major):
     total_hint = "最后一页" if is_last else "下一页: d"
     print(f"\n{'='*70}")
     print(f"  搜索: \"{keyword}\"  |  第 {page_number + 1} 页  |  {total_hint}")
@@ -200,7 +233,7 @@ def display_page(courses, page_number, is_last, keyword, jxblx_map):
             time_str = _format_time(c)
             campus = c.get("campusName", "?")
             credit = c.get("credit", "?")
-            _, _, ctype_name = lookup_kind_type(c.get("jxblx", "?"), jxblx_map)
+            _, _, ctype_name = classify_course(c, jxblx_map, student_major)
 
             print(f"\n  [{i:>2}] {name}  ({credit}学分, {ctype_name})")
             print(f"       课程号: {c.get('courseNumber', '?')}  |  教师: {teacher}")
@@ -248,13 +281,14 @@ def _add_to_course_conf(class_id, kind, ctype, remark):
     return True
 
 
-def _show_course_detail(course, jxblx_map):
+def _show_course_detail(course, jxblx_map, student_major):
     class_id = course.get("teachingClassID", "?")
     name = course.get("courseName", "?")
     teacher = course.get("teacherName", "?")
     time_str = _format_time(course)
     jxblx = course.get("jxblx", "?")
-    kind, ctype, ctype_name = lookup_kind_type(jxblx, jxblx_map)
+    raw_ctype = lookup_kind_type(jxblx, jxblx_map)[1]
+    kind, ctype, ctype_name = classify_course(course, jxblx_map, student_major)
 
     print(f"\n{'─'*70}")
     print(f"  课程名称:  {name}")
@@ -271,6 +305,9 @@ def _show_course_detail(course, jxblx_map):
     print(f"  jxblx:             {jxblx}  (原始值)")
     print(f"{'─'*70}")
     print(f"  ℹ️ courseKind / teachingClassType 从平台接口动态获取")
+    if raw_ctype == "ZY" and ctype != "ZY":
+        print(f"  ⚠️ 本课在开课院系为专业课，但你的专业不在可选名单中，")
+        print(f"     已自动纠正为跨专业（{ctype}/courseKind={kind}）选课")
 
     if ctype == "??":
         print(f"  ❌ 未找到 jxblx={jxblx} 对应的类别，无法自动添加")
@@ -306,9 +343,9 @@ def main():
         sys.exit(1)
     print(">>> 登录成功")
 
-    # 动态获取 jxblx 映射
+    # 动态获取 jxblx 映射 + 本人专业
     print(">>> 正在从平台获取课程参数映射...")
-    jxblx_map = fetch_jxblx_map(student_code, cookies, token, proxies)
+    jxblx_map, student_major = fetch_student_context(student_code, cookies, token, proxies)
     if jxblx_map is None:
         print("❌ 无法获取课程参数映射，退出")
         sys.exit(1)
@@ -316,6 +353,7 @@ def main():
     for k in sorted(jxblx_map.keys(), key=lambda x: int(x)):
         ck, mc, mn = jxblx_map[k]
         print(f"    jxblx={k:>2s} → courseKind={ck:<5s}  type={mc:<6s}  {mn}")
+    print(f">>> 本人专业代码: {student_major or '(未获取，跨专业纠正将跳过)'}")
     print()
 
     keyword = ""
@@ -344,9 +382,10 @@ def main():
                     print("❌ 重新登录失败")
                     sys.exit(1)
                 # 重新登录后也刷新映射
-                new_map = fetch_jxblx_map(student_code, cookies, token, proxies)
+                new_map, new_major = fetch_student_context(student_code, cookies, token, proxies)
                 if new_map:
                     jxblx_map = new_map
+                    student_major = new_major
                 result = query_courses(keyword, page_number, student_code, batch_code, cookies, token, proxies)
                 if result is None:
                     print("❌ 查询仍然失败")
@@ -356,7 +395,7 @@ def main():
             cached_pages[page_number] = (courses, is_last)
 
         clear_screen()
-        display_page(courses, page_number, is_last, keyword, jxblx_map)
+        display_page(courses, page_number, is_last, keyword, jxblx_map, student_major)
 
         cmd = input("\n>>> ").strip().lower()
 
@@ -384,7 +423,7 @@ def main():
             else:
                 idx = int(cmd)
                 if 1 <= idx <= len(courses):
-                    _show_course_detail(courses[idx - 1], jxblx_map)
+                    _show_course_detail(courses[idx - 1], jxblx_map, student_major)
                 else:
                     print(f"无效编号，请输入 1~{len(courses)}")
                     input("按回车继续...")
